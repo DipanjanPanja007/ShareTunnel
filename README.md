@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # ⟆ ShareTunnel — P2P File Transfer
 
 Secure peer-to-peer file transfer via WebRTC DataChannels.
@@ -233,3 +234,7 @@ Free/cheap TURN providers: **Twilio**, **Xirsys**, **Metered.ca**, or self-host 
 | Session already occupied | HTTP 409 |
 | File corruption | SHA-256 mismatch → error, no download |
 | Large files (10 GB+) | Streaming slices — never fully in memory |
+=======
+# ShareTunnel
+Peer to Peer File transfer application with no file size limit
+>>>>>>> c8015240848bb67aaabc79914380f051167fd2f3
