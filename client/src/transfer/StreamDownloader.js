@@ -14,23 +14,10 @@
  * Before that, chunks are buffered locally and sent once SW is ready.
  * This prevents the 0-byte file problem.
  *
- * MEMORY SAFETY (FIX):
- * _queue is capped at MAX_PRE_READY_QUEUE chunks. Since the sender now
- * waits for STREAM_READY before pumping, this queue should never accumulate
- * more than a handful of retransmit/race chunks. The cap is a hard safety net.
- * If the cap is exceeded, write() throws — the receiver must surface this as
- * an error and abort the transfer rather than silently accumulating data.
- *
  * The download dialog: Chrome shows "Save as" only if the page is in a
  * secure context (HTTPS or localhost). On HTTP, it auto-downloads to
  * the default folder — this is a browser security restriction, not our bug.
  */
-
-// FIX: Maximum chunks buffered before SW is ready.
-// After the STREAM_READY backpressure protocol this should stay near 0.
-// Cap is 2 × WINDOW_SIZE = 32 chunks = 2 MB absolute ceiling.
-const MAX_PRE_READY_QUEUE = 32;
-
 export class StreamDownloader {
   constructor(filename, size) {
     this.filename = filename;
@@ -40,12 +27,7 @@ export class StreamDownloader {
     this._ready   = false;   // true once SW sends {ready:true}
     this._closed  = false;
     this._aborted = false;
-    // FIX: _queue is now bounded — see MAX_PRE_READY_QUEUE
-    this._queue   = [];      // chunks buffered before SW is ready (bounded)
-    // FIX: Callback for SW runtime errors after streaming is live.
-    // Set by ChunkReceiver._setupPath() immediately after creating this instance.
-    // Called with a reason string when SW signals { error } on the port.
-    this.onError  = null;
+    this._queue   = [];      // chunks buffered before SW is ready
   }
 
   /**
@@ -72,21 +54,11 @@ export class StreamDownloader {
         port1.onmessage = ({ data }) => {
           if (data.ready) {
             clearTimeout(timeout);
-            // FIX: Restore normal message handler — handle both cancellation
-            // AND SW runtime errors (e.g. sw_waiters_overflow) so they are
-            // never silently swallowed after streaming is live.
+            // Restore normal message handler
             port1.onmessage = ({ data }) => {
               if (data.cancelled) {
                 console.warn('[StreamDownloader] user cancelled download');
                 this._aborted = true;
-              } else if (data.error) {
-                // FIX: SW signalled a runtime error — abort and notify caller
-                console.error('[StreamDownloader] SW error after ready:', data.error);
-                this._aborted = true;
-                this._queue = []; // defensive: release any residual memory
-                if (typeof this.onError === 'function') {
-                  this.onError(String(data.error));
-                }
               }
             };
             resolve();
@@ -122,7 +94,6 @@ export class StreamDownloader {
       for (const buf of this._queue) {
         this._port.postMessage({ chunk: buf }, [buf]);
       }
-      // FIX: Release queue array immediately after flush
       this._queue = [];
 
       // If close() was called before we were ready, send done now
@@ -133,8 +104,6 @@ export class StreamDownloader {
       return true;
     } catch (e) {
       console.warn('[StreamDownloader] init failed:', e.message, '— using Blob fallback');
-      // FIX: Release any queued chunks on failure to avoid memory leak
-      this._queue = [];
       return false;
     }
   }
@@ -142,28 +111,12 @@ export class StreamDownloader {
   /**
    * Write a chunk. Safe to call before init() resolves —
    * chunks are queued and flushed once SW is ready.
-   *
-   * FIX: Throws if the pre-ready queue cap is exceeded. This should
-   * never happen under normal operation (sender waits for STREAM_READY),
-   * but acts as a hard safety net against unbounded buffering.
    */
   write(buffer) {
     if (this._aborted || this._closed) return;
     if (this._ready && this._port) {
       this._port.postMessage({ chunk: buffer }, [buffer]);
     } else {
-      // FIX: Hard cap on pre-ready queue — prevents O(file_size) buffering
-      if (this._queue.length >= MAX_PRE_READY_QUEUE) {
-        // This indicates a protocol violation: sender sent chunks before
-        // STREAM_READY was acknowledged. Abort rather than buffer unboundedly.
-        console.error(
-          `[StreamDownloader] pre-ready queue overflow (cap=${MAX_PRE_READY_QUEUE}) — ` +
-          'aborting. Sender should wait for STREAM_READY before pumping.'
-        );
-        this._aborted = true;
-        if (this._port) this._port.postMessage({ error: 'queue_overflow' });
-        throw new Error('StreamDownloader: pre-ready queue overflow — possible protocol violation');
-      }
       // Buffer until SW confirms ready
       this._queue.push(buffer);
     }
@@ -181,8 +134,6 @@ export class StreamDownloader {
   /** Abort on error */
   abort(reason = 'aborted') {
     this._aborted = true;
-    // FIX: Release queue on abort
-    this._queue = [];
     if (this._port) {
       this._port.postMessage({ error: String(reason) });
     }

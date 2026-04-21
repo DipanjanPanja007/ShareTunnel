@@ -23,29 +23,12 @@
  * 5. CPU waste: outer pump slept only 2ms waiting for window to open.
  *    FIX: Progressive backoff up to 50ms.
  *
- * 6. (FIX) BACKPRESSURE: sender started pumping immediately after sending
- *    the file-header, before the receiver confirmed its streaming path was
- *    ready. On slow SW init paths this caused chunks to arrive before the
- *    write path existed, forcing the receiver into unbounded buffering.
- *    FIX: start() now waits for {type:'STREAM_READY'} from receiver before
- *    calling _pump(). Timeout of 15 s guards against a stuck receiver.
- *
- * 7. (FIX) SHA-256 memory: _sha256 concatenated all 4 MB slices into one
- *    giant Uint8Array before hashing — O(file_size) RAM for files ≤512 MB.
- *    FIX: Use an incremental DigestStream (if available) or hash slice-by-
- *    slice via SubtleCrypto update polyfill. Falls back to existing approach
- *    only for files that fit safely.
- *
- * 8. (FIX) ABORT propagation: receiver can send {type:'ABORT'} if no
- *    streaming path is available for a large file. Sender now handles it.
- *
  * THRESHOLDS (tuned per spec):
  *   CHUNK_SIZE  = 64 KB
  *   WINDOW_SIZE = 16       (max in-flight chunks)
  *   BP_THRESHOLD            = 2 MB  (pause sending when queue reaches this)
  *   bufferedAmountLowThreshold = 1 MB  (resume when queue drains to this)
  *   DRAIN_TIMEOUT           = 200ms (fallback if bufferedamountlow doesn't fire)
- *   STREAM_READY_TIMEOUT    = 15 s  (abort if receiver never confirms ready)
  */
 
 const CHUNK_SIZE              = 64 * 1024;
@@ -55,8 +38,6 @@ const BP_THRESHOLD            = 2 * 1024 * 1024; // 2 MB — pause threshold
 const BUFFERED_AMOUNT_LOW     = 1 * 1024 * 1024; // 1 MB — resume threshold (< BP)
 const DRAIN_TIMEOUT           = 200;              // ms — fallback if event never fires
 const HASH_LIMIT              = 512 * 1024 * 1024;
-// FIX: How long to wait for receiver's STREAM_READY before aborting
-const STREAM_READY_TIMEOUT    = 15_000;
 
 export class ChunkSender {
   constructor(dc, file, { onProgress, onComplete, onError } = {}) {
@@ -81,15 +62,6 @@ export class ChunkSender {
     this._lastStatAt   = Date.now();
     this._lastDatBytes = 0;
 
-    // FIX: Promise that resolves when receiver sends STREAM_READY.
-    // _pump() awaits this before sending any data chunks.
-    this._streamReadyResolve = null;
-    this._streamReadyReject  = null;
-    this._streamReadyPromise = new Promise((res, rej) => {
-      this._streamReadyResolve = res;
-      this._streamReadyReject  = rej;
-    });
-
     // CRITICAL: set threshold so browser knows when to fire bufferedamountlow
     // Must be LESS than BP_THRESHOLD or the event fires after we already paused
     this.dc.bufferedAmountLowThreshold = BUFFERED_AMOUNT_LOW;
@@ -106,63 +78,17 @@ export class ChunkSender {
       mimeType: this.file.type || 'application/octet-stream',
       totalChunks: this.totalChunks,
     });
-
-    // FIX: Wait for receiver to confirm its streaming path is ready.
-    // Without this, chunks arrive before the receiver has set up FSAPI/SW,
-    // causing it to buffer chunks in RAM (_preHeaderBuffer or fallback Map).
-    console.log('[sender] waiting for receiver STREAM_READY…');
-    const readyRace = Promise.race([
-      this._streamReadyPromise,
-      new Promise((_, rej) =>
-        setTimeout(() => rej(new Error('STREAM_READY timeout')), STREAM_READY_TIMEOUT)
-      ),
-    ]);
-    try {
-      await readyRace;
-    } catch (e) {
-      if (!this.aborted) {
-        console.error('[sender] receiver never sent STREAM_READY — aborting:', e.message);
-        this.aborted = true;
-        this.onError?.(`Receiver not ready: ${e.message}`);
-      }
-      return;
-    }
-
-    if (this.aborted) return;
-    console.log('[sender] STREAM_READY received — starting pump');
     await this._pump();
   }
 
   onControlMessage(msg) {
-    if (msg.type === 'ACK')          this._onAck(msg.seq);
-    if (msg.type === 'MISSING')      this._onMissing(msg.seqs);
-    if (msg.type === 'DONE')         this.aborted = true;
-    // FIX: Handle STREAM_READY from receiver — unblock _pump()
-    if (msg.type === 'STREAM_READY') this._onStreamReady();
-    // FIX: Handle ABORT from receiver (e.g. no streaming for large file)
-    if (msg.type === 'ABORT')        this._onAbort(msg.reason);
+    if (msg.type === 'ACK')     this._onAck(msg.seq);
+    if (msg.type === 'MISSING') this._onMissing(msg.seqs);
+    if (msg.type === 'DONE')    this.aborted = true;
   }
 
   abort() {
     this.aborted = true;
-    for (const id of this.timers.values()) clearTimeout(id);
-    this.timers.clear();
-    // FIX: Reject the stream-ready promise so start() unblocks cleanly
-    this._streamReadyReject?.(new Error('aborted'));
-  }
-
-  // FIX: Called when receiver signals its streaming path is confirmed
-  _onStreamReady() {
-    console.log('[sender] receiver STREAM_READY acknowledged');
-    this._streamReadyResolve?.();
-  }
-
-  // FIX: Called when receiver cannot accept the file (no streaming for large file)
-  _onAbort(reason) {
-    console.error(`[sender] receiver aborted transfer: ${reason}`);
-    this.aborted = true;
-    this._streamReadyReject?.(new Error(`receiver ABORT: ${reason}`));
-    this.onError?.(`Receiver cannot accept file: ${reason}`);
     for (const id of this.timers.values()) clearTimeout(id);
     this.timers.clear();
   }
@@ -374,15 +300,7 @@ export class ChunkSender {
     this.onComplete?.();
   }
 
-  // ── SHA-256 — O(SLICE) RAM, never loads full file ────────────────────────
-  // FIX: Previous implementation concatenated all slices into one large
-  // Uint8Array (O(file_size) RAM) before calling digest(). For a 512 MB
-  // file that's 512 MB in RAM just for hashing.
-  //
-  // New approach: use the WHATWG DigestStream API when available (Chrome 109+)
-  // for true incremental hashing with O(1) RAM. Fallback: hash slice-by-slice
-  // using a running concatenation but only for files ≤ HASH_LIMIT (512 MB)
-  // where we already accepted the RAM cost.
+  // ── SHA-256 (reads file in 4 MB slices, not full load) ───────────────────
   async _sha256() {
     if (this.file.size === 0)
       return 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855';
@@ -390,35 +308,6 @@ export class ChunkSender {
       console.warn('[sender] >512 MB — skipping SHA-256');
       return '';
     }
-
-    // FIX: Try DigestStream first — O(1) RAM, truly incremental
-    if (typeof DigestStream !== 'undefined') {
-      try {
-        const ds = new DigestStream('SHA-256');
-        const writer = ds.getWriter();
-        const SLICE  = 4 * 1024 * 1024;
-        let   off    = 0;
-        while (off < this.file.size) {
-          const buf = await this.file.slice(off, off + SLICE).arrayBuffer();
-          await writer.write(new Uint8Array(buf));
-          off += buf.byteLength;
-          await this._sleep(0); // yield between slices
-        }
-        await writer.close();
-        const h   = await ds.digest;
-        const hex = [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, '0')).join('');
-        return hex;
-      } catch (e) {
-        console.warn('[sender] DigestStream failed, falling back:', e.message);
-        // fall through to legacy path
-      }
-    }
-
-    // FIX (legacy fallback): Read in 4 MB slices and hash each piece,
-    // then combine using the fact that we can't do incremental SubtleCrypto
-    // without DigestStream. For files ≤ HASH_LIMIT we accept O(file_size)
-    // RAM here since HASH_LIMIT is 512 MB and this is the sender reading
-    // its own file (which it already has on disk). The RECEIVER never hashes.
     try {
       const SLICE = 4 * 1024 * 1024;
       const parts = [];
@@ -429,8 +318,6 @@ export class ChunkSender {
         off += buf.byteLength;
         await this._sleep(0); // yield between slices
       }
-      // FIX: Allocate exactly once, not incrementally — same total size
-      // but avoids repeated reallocation from Array.push patterns.
       const total = parts.reduce((s, p) => s + p.byteLength, 0);
       const all   = new Uint8Array(total);
       let   pos   = 0;

@@ -16,21 +16,14 @@
  *   incrementally. RAM = O(in-flight chunks).
  *
  * FALLBACK PATH (iOS Safari / no SW / picker declined):
- *   ONLY permitted for files ≤ BLOB_FALLBACK_LIMIT (100 MB).
- *   For larger files the transfer is ABORTED before chunks arrive.
+ *   Stores all chunks in Map → Blob at end. RAM = O(file size).
  *   Warning shown to user before transfer.
  *
- * BACKPRESSURE PROTOCOL:
- *   Receiver sends {type:'STREAM_READY'} AFTER streaming path is confirmed.
- *   Sender MUST NOT start pump() until STREAM_READY is received.
- *   This prevents any chunk from arriving before the write path is set up.
- *
- * RAM BUDGET (streaming paths, 100 GB file):
+ * RAM BUDGET (streaming paths, 7 GB file):
  *   _pickerBuf / _streamBuf: max WINDOW_SIZE × 64 KB = 1 MB
  *   _gapSet:                 max WINDOW_SIZE × 40 B  = ~1 KB
  *   pendingAcks:             max WINDOW_SIZE entries = ~1 KB
- *   _preHeaderBuffer:        max PRE_HEADER_CAP × 64 KB = 128 KB   // FIX
- *   TOTAL:                   ~1–2 MB constant
+ *   TOTAL:                   ~1 MB constant
  *
  * KEY INVARIANT:
  *   showSaveFilePicker() is called ONLY in the button click handler
@@ -44,16 +37,6 @@ const ACK_FLUSH_INTERVAL    = 80;
 const MISSING_SCAN_INTERVAL = 3_000;
 const HASH_LIMIT            = 512 * 1024 * 1024;
 const WINDOW_SIZE           = 16; // must match ChunkSender
-
-// FIX: Hard limit on pre-header buffer. Chunks arriving before the header is
-// processed are buffered here. Capped at 2 × WINDOW_SIZE so no unbounded
-// growth is possible even if a rogue sender floods us before the header lands.
-const PRE_HEADER_CAP = WINDOW_SIZE * 2; // 32 chunks max = 2 MB
-
-// FIX: Blob fallback is ONLY allowed for files below this threshold.
-// Files larger than this require streaming (FSAPI or SW) and will be
-// aborted BEFORE any chunk is stored if streaming is unavailable.
-const BLOB_FALLBACK_LIMIT = 100 * 1024 * 1024; // 100 MB
 
 export const STREAMING_SUPPORTED =
   typeof window !== 'undefined' && 'serviceWorker' in navigator;
@@ -74,7 +57,7 @@ export class ChunkReceiver {
    *
    * writable: pre-opened from showSaveFilePicker() in the button click.
    *   If provided → FSAPI streaming path (best: direct to chosen disk location).
-   *   If null     → SW streaming (Downloads folder) or Blob fallback (≤100 MB).
+   *   If null     → SW streaming (Downloads folder) or Blob fallback.
    */
   constructor(dc, { writable = null, onProgress, onComplete, onError, onCancelled } = {}) {
     this.dc          = dc;
@@ -91,13 +74,10 @@ export class ChunkReceiver {
     this.totalChunks = 0;
 
     this._headerDone      = false;
-    // FIX: _preHeaderBuffer is now capped at PRE_HEADER_CAP entries.
-    // If cap is exceeded, additional chunks are dropped and will be
-    // re-requested via MISSING after path setup completes.
-    this._preHeaderBuffer = []; // bounded: max PRE_HEADER_CAP chunks
+    this._preHeaderBuffer = []; // chunks arriving before header is processed
 
     // ── Path selection ────────────────────────────────────────────────────
-    // Priority: writable (FSAPI) > SW streaming > Blob fallback (small files only)
+    // Priority: writable (FSAPI) > SW streaming > Blob fallback
 
     // FSAPI path — writable pre-opened in user gesture
     this._writable      = writable;   // FileSystemWritableFileStream
@@ -112,9 +92,9 @@ export class ChunkReceiver {
     this._nextWriteSeq  = 0;
     this._streamBuf     = new Map(); // out-of-order buffer, max WINDOW_SIZE
 
-    // Blob fallback — ONLY for files ≤ BLOB_FALLBACK_LIMIT
+    // Blob fallback
     this._useFallback = false;
-    this._received    = new Map(); // seq→ArrayBuffer — ONLY for fallback, small files
+    this._received    = new Map(); // seq→ArrayBuffer — ONLY for fallback
 
     // ── Dedup tracking — O(WINDOW_SIZE) not O(totalChunks) ───────────────
     this._highWatermark = -1;  // all seqs 0.._highWatermark confirmed received
@@ -126,10 +106,6 @@ export class ChunkReceiver {
     this._scanTimer  = null;
     this._done       = false;
     this._cancelled  = false;
-
-    // FIX: Track whether STREAM_READY has been sent to the sender.
-    // Sender must not pump until this is sent.
-    this._streamReadySent = false;
 
     // Progress
     this._bytesReceived = 0;
@@ -154,9 +130,6 @@ export class ChunkReceiver {
       this._writable.abort?.().catch(() => {});
       this._writable = null;
     }
-    // FIX: Release pre-header buffer on destroy to avoid memory retention
-    this._preHeaderBuffer = [];
-    this._received.clear();
   }
 
   // ── Text messages ─────────────────────────────────────────────────────────
@@ -175,107 +148,42 @@ export class ChunkReceiver {
     this.mimeType    = msg.mimeType ?? 'application/octet-stream';
     this.totalChunks = msg.totalChunks ?? 0;
     console.log(`[receiver] "${this.fileName}" — ${this.totalChunks} chunks`);
-    this._setupPath(); // fire-and-forget async; sends STREAM_READY when done
+    this._setupPath(); // fire-and-forget async
   }
 
   async _setupPath() {
     if (this._usePicker) {
       // Writable already open — nothing to set up
       console.log('[receiver] FSAPI: direct write to chosen location');
-
     } else if (STREAMING_SUPPORTED) {
       // Try SW streaming
       try {
         const dl = new StreamDownloader(this.fileName, this.fileSize);
-
-        // FIX: Wire up SW runtime errors (e.g. sw_waiters_overflow) so they
-        // propagate to onError and abort the transfer cleanly, rather than
-        // being swallowed silently inside StreamDownloader.
-        dl.onError = (reason) => {
-          if (this._done || this._cancelled) return;
-          console.error('[receiver] SW streaming error — aborting:', reason);
-          this._done = true;
-          this._downloader = null;
-          this._useStreaming = false;
-          this.onError?.(`Streaming error: ${reason}`);
-        };
-
         const ok = await dl.init();
         if (ok) {
           this._downloader  = dl;
           this._useStreaming = true;
           console.log('[receiver] SW streaming active');
         } else {
-          // FIX: SW init returned false — only allow Blob fallback for small files
-          if (this.fileSize > BLOB_FALLBACK_LIMIT) {
-            console.error(
-              `[receiver] SW unavailable and file (${this.fileSize} B) exceeds ` +
-              `Blob fallback limit (${BLOB_FALLBACK_LIMIT} B) — aborting`
-            );
-            this._abortLargeFileFallback();
-            return;
-          }
           this._useFallback = true;
-          console.warn('[receiver] SW failed — Blob fallback (small file)');
         }
       } catch (e) {
-        // FIX: SW threw — same large-file guard
-        if (this.fileSize > BLOB_FALLBACK_LIMIT) {
-          console.error(`[receiver] SW error for large file — aborting: ${e.message}`);
-          this._abortLargeFileFallback();
-          return;
-        }
         console.warn('[receiver] SW failed, Blob fallback:', e.message);
         this._useFallback = true;
       }
-
     } else {
-      // FIX: No SW at all — guard large files
-      if (this.fileSize > BLOB_FALLBACK_LIMIT) {
-        console.error('[receiver] No streaming available for large file — aborting');
-        this._abortLargeFileFallback();
-        return;
-      }
       this._useFallback = true;
-      console.warn('[receiver] No SW — Blob fallback (small file)');
     }
 
     this._headerDone = true;
 
-    // FIX: Send STREAM_READY NOW — before draining pre-header buffer.
-    // Sender is blocked waiting for this signal and has sent zero data chunks.
-    // Pre-header buffer should be empty or have at most a few control frames.
-    this._sendStreamReady();
-
-    // Drain chunks buffered during setup (bounded by PRE_HEADER_CAP)
+    // Drain chunks buffered during setup
     for (const { seq, data } of this._preHeaderBuffer) {
       this._storeChunk(seq, data);
     }
-    this._preHeaderBuffer = []; // FIX: release memory immediately
+    this._preHeaderBuffer = null;
 
     this._startScanTimer();
-  }
-
-  // FIX: Hard abort when large file has no streaming path.
-  // Sends error to sender and calls onError — transfer is cleanly terminated.
-  _abortLargeFileFallback() {
-    this._done = true;
-    this._headerDone = true;
-    this._preHeaderBuffer = []; // release memory
-    this._send({ type: 'ABORT', reason: 'NO_STREAMING' });
-    this.onError?.(
-      `Streaming unavailable. Files larger than ${BLOB_FALLBACK_LIMIT / 1024 / 1024} MB ` +
-      `require Chrome/Edge with File System Access API or Service Worker support.`
-    );
-  }
-
-  // FIX: Notify sender that receiver streaming path is confirmed and ready.
-  // Sender waits for this before calling _pump().
-  _sendStreamReady() {
-    if (this._streamReadySent) return;
-    this._streamReadySent = true;
-    this._send({ type: 'STREAM_READY' });
-    console.log('[receiver] STREAM_READY sent — sender may begin pumping');
   }
 
   // ── Binary frames — SYNCHRONOUS ───────────────────────────────────────────
@@ -301,24 +209,6 @@ export class ChunkReceiver {
     if (seq <= this._highWatermark) return;
     if (this._gapSet.has(seq)) return;
 
-    // FIX: Pre-header cap check MUST happen BEFORE we update the dedup
-    // watermark. If we updated the watermark first and then dropped the chunk,
-    // _getMissing() would never scan below _highWatermark and the dropped seq
-    // would be permanently lost — no retransmit would ever be requested.
-    //
-    // By returning early here, we leave _highWatermark and _gapSet unchanged,
-    // so the seq stays "unseen". The sender's ACK_TIMEOUT will retransmit it
-    // after _setupPath() completes and STREAM_READY is sent. Under the
-    // STREAM_READY protocol this branch should never trigger in normal use
-    // because the sender waits for STREAM_READY before pumping chunks.
-    if (!this._headerDone && this._preHeaderBuffer.length >= PRE_HEADER_CAP) {
-      console.warn(
-        `[receiver] pre-header buffer full (cap=${PRE_HEADER_CAP}), ` +
-        `ignoring seq=${seq} — sender will retransmit after STREAM_READY`
-      );
-      return; // DO NOT update watermark or gapSet — chunk stays retransmittable
-    }
-
     const data = buffer.slice(4 + metaLen);
     this._bytesReceived += data.byteLength;
 
@@ -330,7 +220,7 @@ export class ChunkReceiver {
     }
 
     if (!this._headerDone) {
-      this._preHeaderBuffer.push({ seq, data }); // safe: cap enforced above
+      this._preHeaderBuffer.push({ seq, data });
     } else {
       this._storeChunk(seq, data);
     }
@@ -344,13 +234,6 @@ export class ChunkReceiver {
 
   _storeChunk(seq, data) {
     if (this._useFallback) {
-      // FIX: Double-guard — should never reach here for large files,
-      // but defensive check ensures we never silently grow unboundedly.
-      if (this.fileSize > BLOB_FALLBACK_LIMIT) {
-        console.error('[receiver] BUG: _storeChunk called on large file in fallback mode — aborting');
-        this._abortLargeFileFallback();
-        return;
-      }
       this._received.set(seq, data); // only path that holds all data
       return;
     }
@@ -390,20 +273,7 @@ export class ChunkReceiver {
     while (this._streamBuf.has(this._nextWriteSeq) && this._downloader) {
       const data = this._streamBuf.get(this._nextWriteSeq);
       this._streamBuf.delete(this._nextWriteSeq); // discard immediately
-      // FIX: Wrap write() in try/catch. StreamDownloader.write() throws if
-      // the pre-ready queue cap is exceeded (protocol violation). An uncaught
-      // exception here would kill the DataChannel onmessage handler entirely,
-      // making the receiver permanently deaf to all further messages.
-      try {
-        this._downloader.write(data);
-      } catch (e) {
-        console.error('[receiver] _flushStreamBuf write error — aborting:', e.message);
-        this._done = true;
-        this._downloader?.abort(e.message);
-        this._downloader = null;
-        this.onError?.(`Stream write error: ${e.message}`);
-        return; // stop flushing
-      }
+      this._downloader.write(data);
       this._nextWriteSeq++;
     }
   }
