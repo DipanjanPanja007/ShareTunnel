@@ -10,13 +10,13 @@
  * data arrives from the network → Chrome buffers a little → writes to disk.
  *
  * The .crswap rename is fast because Chrome writes chunks to disk
- * incrementally as they arrive in the ReadableStream, instead of
+ * incrementally as they arrive in the ReadableStream, instead of 
  * buffering everything and flushing at the end.
  */
 
 const MAP = new Map(); // token → { port, filename, size, controller, resolve }
 
-self.addEventListener('install',  () => self.skipWaiting());
+self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
 
 // Main thread sends chunks here via the MessageChannel port
@@ -67,7 +67,7 @@ self.addEventListener('fetch', (e) => {
   if (!url.pathname.startsWith('/_sharetunnel_dl/')) return;
 
   const token = url.pathname.slice('/_sharetunnel_dl/'.length);
-  const slot  = MAP.get(token);
+  const slot = MAP.get(token);
   if (!slot) return;
 
   const { filename, size } = slot;
@@ -78,7 +78,7 @@ self.addEventListener('fetch', (e) => {
 
       // Drain anything buffered before stream started
       for (const item of slot.waiters) {
-        if (item.chunk)    controller.enqueue(item.chunk);
+        if (item.chunk) controller.enqueue(item.chunk);
         else if (item.done) { controller.close(); MAP.delete(token); return; }
       }
       slot.waiters = [];
@@ -90,16 +90,16 @@ self.addEventListener('fetch', (e) => {
       slot.port.postMessage({ cancelled: true });
       MAP.delete(token);
     },
-  // highWaterMark:2 — keep 2 chunks buffered in the ReadableStream queue.
-  // This prevents stalls: while Chrome writes chunk N to disk, chunk N+1
-  // is already queued, so Chrome never has to wait for the next chunk.
+    // highWaterMark:2 — keep 2 chunks buffered in the ReadableStream queue.
+    // This prevents stalls: while Chrome writes chunk N to disk, chunk N+1
+    // is already queued, so Chrome never has to wait for the next chunk.
   }, new CountQueuingStrategy({ highWaterMark: 2 }));
 
   e.respondWith(new Response(stream, {
     headers: new Headers({
-      'Content-Type':        'application/octet-stream; charset=utf-8',
+      'Content-Type': 'application/octet-stream; charset=utf-8',
       'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`,
-      'Content-Length':      String(size),
+      'Content-Length': String(size),
       'X-Content-Type-Options': 'nosniff',
     }),
     status: 200,
