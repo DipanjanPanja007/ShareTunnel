@@ -1,0 +1,36 @@
+/* Tailwind CSS v4 — single directive replaces base/components/utilities */
+@import "tailwindcss";
+
+/* ── Global ── */
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+}
+
+body {
+  font-family: 'JetBrains Mono', 'Courier New', monospace;
+  background: #090910;
+  color: #e8e8f0;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Custom animations not in Tailwind v4 defaults ── */
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.3; }
+}
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position:  200% 0; }
+}
+@keyframes slide-up {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+.animate-pulse-dot { animation: pulse-dot 1.4s ease-in-out infinite; }
+.animate-shimmer   { animation: shimmer 2s linear infinite; }
+.animate-slide-up  { animation: slide-up 0.35s ease-out both; }

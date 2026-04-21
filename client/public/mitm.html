@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<!--
+  ShareTunnel mitm.html
+  This page is loaded in a hidden iframe to register the Service Worker
+  on the same origin as the main app. Must be served from the same origin.
+-->
+<html>
+<head><meta charset="UTF-8"></head>
+<body>
+<script>
+  // Register the SW scoped to the root of this origin
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js', { scope: '/' })
+      .then(() => {
+        // Notify parent that SW is registered and ready
+        window.parent.postMessage('sharetunnel-sw-ready', '*');
+      })
+      .catch((err) => {
+        window.parent.postMessage({ type: 'sharetunnel-sw-error', error: err.message }, '*');
+      });
+  } else {
+    window.parent.postMessage({ type: 'sharetunnel-sw-error', error: 'ServiceWorker not supported' }, '*');
+  }
+</script>
+</body>
+</html>
