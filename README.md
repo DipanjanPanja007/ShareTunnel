@@ -1,4 +1,4 @@
-<<<<<<< HEAD
+
 # ⟆ ShareTunnel — P2P File Transfer
 
 Secure peer-to-peer file transfer via WebRTC DataChannels.
