@@ -16,7 +16,8 @@ export default defineConfig({
     proxy: {
       // Proxy REST API calls to the signaling server
       '/api': {
-        target: 'http://localhost:3001',
+        // target: 'http://localhost:3001',
+        target: process.env.VITE_SERVER_URL || 'http://localhost:3001',
         changeOrigin: true,
       },
     },
