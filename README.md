@@ -237,4 +237,3 @@ Free/cheap TURN providers: **Twilio**, **Xirsys**, **Metered.ca**, or self-host 
 =======
 # ShareTunnel
 Peer to Peer File transfer application with no file size limit
->>>>>>> c8015240848bb67aaabc79914380f051167fd2f3
